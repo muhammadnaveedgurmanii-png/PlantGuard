@@ -4,13 +4,41 @@ import { getOrCreateSessionId } from '../lib/session'
 
 const community = new Hono<{ Bindings: Bindings }>()
 
-// GET /api/community/posts
+// GET /api/community/posts?page=1&page_size=10
+// PHASE 14: Fixed N+1 query. Previously ran one `comments` query PER post.
+// Now runs exactly 3 queries total regardless of page size: one page of
+// posts, one batched comments query (WHERE post_id IN (...)), and one
+// batched likes query for the current session.
 community.get('/posts', async (c) => {
   const sessionId = getOrCreateSessionId(c)
+  const page = Math.max(1, parseInt(c.req.query('page') || '1', 10) || 1)
+  const pageSize = Math.min(50, Math.max(1, parseInt(c.req.query('page_size') || '10', 10) || 10))
+  const offset = (page - 1) * pageSize
+
+  const countRow = await c.env.DB.prepare(`SELECT COUNT(*) as cnt FROM posts`).first()
+  const totalPosts = (countRow as any)?.cnt ?? 0
 
   const { results: posts } = await c.env.DB.prepare(
-    `SELECT * FROM posts ORDER BY created_at DESC`
-  ).all()
+    `SELECT * FROM posts ORDER BY created_at DESC LIMIT ? OFFSET ?`
+  )
+    .bind(pageSize, offset)
+    .all()
+
+  const postIds = (posts as any[]).map((p) => p.id)
+
+  let commentsByPost: Record<number, any[]> = {}
+  if (postIds.length > 0) {
+    const placeholders = postIds.map(() => '?').join(',')
+    const { results: comments } = await c.env.DB.prepare(
+      `SELECT * FROM comments WHERE post_id IN (${placeholders}) ORDER BY created_at ASC`
+    )
+      .bind(...postIds)
+      .all()
+    for (const cm of comments as any[]) {
+      if (!commentsByPost[cm.post_id]) commentsByPost[cm.post_id] = []
+      commentsByPost[cm.post_id].push(cm)
+    }
+  }
 
   const { results: likedRows } = await c.env.DB.prepare(
     `SELECT post_id FROM post_likes WHERE session_id = ?`
@@ -19,51 +47,80 @@ community.get('/posts', async (c) => {
     .all()
   const likedSet = new Set((likedRows as any[]).map((r) => r.post_id))
 
-  const enriched = await Promise.all(
-    (posts as any[]).map(async (p) => {
-      const { results: comments } = await c.env.DB.prepare(
-        `SELECT * FROM comments WHERE post_id = ? ORDER BY created_at ASC`
-      )
-        .bind(p.id)
-        .all()
-      return { ...p, comments, liked_by_me: likedSet.has(p.id) }
-    })
-  )
+  const enriched = (posts as any[]).map((p) => ({
+    ...p,
+    tags: safeParseTags(p.tags),
+    comments: commentsByPost[p.id] || [],
+    liked_by_me: likedSet.has(p.id),
+    editable_by_me: p.session_id === sessionId
+  }))
 
-  return c.json({ posts: enriched })
+  return c.json({
+    posts: enriched,
+    page,
+    page_size: pageSize,
+    total_posts: totalPosts,
+    total_pages: Math.max(1, Math.ceil(totalPosts / pageSize))
+  })
 })
 
-// POST /api/community/posts  { author, title, content }
+// POST /api/community/posts  { author, title, content, tags?: string[] }
 community.post('/posts', async (c) => {
   const sessionId = getOrCreateSessionId(c)
-  const { author, title, content } = await c.req.json<{ author: string; title: string; content: string }>()
+  const { author, title, content, tags } = await c.req.json<{
+    author: string
+    title: string
+    content: string
+    tags?: string[]
+  }>()
 
   if (!author?.trim() || !title?.trim() || !content?.trim()) {
     return c.json({ error: 'Author, title, and content are all required.' }, 400)
   }
+  if (title.length > 200) return c.json({ error: 'Title too long (max 200 characters).' }, 400)
+  if (content.length > 5000) return c.json({ error: 'Content too long (max 5000 characters).' }, 400)
+
+  // PHASE 14: Simple, useful tags -- plant/disease only, not a general tag system.
+  const cleanTags = Array.isArray(tags)
+    ? tags.filter((t) => typeof t === 'string' && t.trim()).slice(0, 5).map((t) => t.trim().slice(0, 60))
+    : []
 
   const result = await c.env.DB.prepare(
-    `INSERT INTO posts (session_id, author, title, content) VALUES (?, ?, ?, ?)`
+    `INSERT INTO posts (session_id, author, title, content, tags) VALUES (?, ?, ?, ?, ?)`
   )
-    .bind(sessionId, author.trim(), title.trim(), content.trim())
+    .bind(sessionId, author.trim().slice(0, 80), title.trim(), content.trim(), JSON.stringify(cleanTags))
     .run()
 
   return c.json({ success: true, id: result.meta.last_row_id })
 })
 
-// PUT /api/community/posts/:id  { title, content } -- only by original author's session
+// PUT /api/community/posts/:id  { title, content, tags? } -- only by original author's session
 community.put('/posts/:id', async (c) => {
   const sessionId = getOrCreateSessionId(c)
   const id = c.req.param('id')
-  const { title, content } = await c.req.json<{ title: string; content: string }>()
+  const { title, content, tags } = await c.req.json<{ title: string; content: string; tags?: string[] }>()
+
+  if (!title?.trim() || !content?.trim()) {
+    return c.json({ error: 'Title and content are required.' }, 400)
+  }
 
   const post = await c.env.DB.prepare(`SELECT session_id FROM posts WHERE id = ?`).bind(id).first()
   if (!post) return c.json({ error: 'Post not found.' }, 404)
   if (post.session_id !== sessionId) return c.json({ error: 'Not authorized to edit this post.' }, 403)
 
-  await c.env.DB.prepare(`UPDATE posts SET title = ?, content = ? WHERE id = ?`)
-    .bind(title.trim(), content.trim(), id)
-    .run()
+  const cleanTags = Array.isArray(tags)
+    ? tags.filter((t) => typeof t === 'string' && t.trim()).slice(0, 5).map((t) => t.trim().slice(0, 60))
+    : undefined
+
+  if (cleanTags) {
+    await c.env.DB.prepare(`UPDATE posts SET title = ?, content = ?, tags = ? WHERE id = ?`)
+      .bind(title.trim(), content.trim(), JSON.stringify(cleanTags), id)
+      .run()
+  } else {
+    await c.env.DB.prepare(`UPDATE posts SET title = ?, content = ? WHERE id = ?`)
+      .bind(title.trim(), content.trim(), id)
+      .run()
+  }
 
   return c.json({ success: true })
 })
@@ -131,12 +188,26 @@ community.post('/posts/:id/comments', async (c) => {
   if (!author?.trim() || !content?.trim()) {
     return c.json({ error: 'Author and content are required.' }, 400)
   }
+  if (content.length > 2000) return c.json({ error: 'Comment too long (max 2000 characters).' }, 400)
+
+  const post = await c.env.DB.prepare(`SELECT id FROM posts WHERE id = ?`).bind(id).first()
+  if (!post) return c.json({ error: 'Post not found.' }, 404)
 
   await c.env.DB.prepare(`INSERT INTO comments (post_id, author, content) VALUES (?, ?, ?)`)
-    .bind(id, author.trim(), content.trim())
+    .bind(id, author.trim().slice(0, 80), content.trim())
     .run()
 
   return c.json({ success: true })
 })
+
+function safeParseTags(v: any): string[] {
+  if (!v) return []
+  try {
+    const parsed = JSON.parse(v)
+    return Array.isArray(parsed) ? parsed : []
+  } catch {
+    return []
+  }
+}
 
 export default community

@@ -6,6 +6,7 @@ import chatbot from './routes/chatbot'
 import weather from './routes/weather'
 import community from './routes/community'
 import library from './routes/library'
+import admin from './routes/admin'
 
 const app = new Hono<{ Bindings: Bindings }>()
 
@@ -24,6 +25,7 @@ app.route('/api/chat', chatbot)
 app.route('/api/weather', weather)
 app.route('/api/community', community)
 app.route('/api/library', library)
+app.route('/api/admin', admin)
 
 app.get('/', (c) => {
   return c.html(INDEX_HTML)

@@ -22,6 +22,9 @@ export type AiLogParams = {
   promptTokens?: number
   completionTokens?: number
   totalTokens?: number
+  fallbackUsed?: boolean
+  fallbackModel?: string
+  toolCallsUsed?: boolean
 }
 
 // Best-effort, approximate per-1K-token cost rates (USD). These are
@@ -47,8 +50,9 @@ export async function logAiCall(params: AiLogParams): Promise<void> {
       .prepare(
         `INSERT INTO ai_call_logs
           (request_type, model, prompt_version, session_id, success, error_type, error_message,
-           latency_ms, prompt_tokens, completion_tokens, total_tokens, estimated_cost_usd)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           latency_ms, prompt_tokens, completion_tokens, total_tokens, estimated_cost_usd,
+           fallback_used, fallback_model, tool_calls_used)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .bind(
         params.requestType,
@@ -62,7 +66,10 @@ export async function logAiCall(params: AiLogParams): Promise<void> {
         params.promptTokens ?? null,
         params.completionTokens ?? null,
         params.totalTokens ?? null,
-        cost
+        cost,
+        params.fallbackUsed ? 1 : 0,
+        params.fallbackModel ?? null,
+        params.toolCallsUsed ? 1 : 0
       )
       .run()
   } catch (e: any) {

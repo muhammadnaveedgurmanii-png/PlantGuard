@@ -1,16 +1,26 @@
 import { Hono } from 'hono'
 import type { Bindings } from '../types'
 import { getOrCreateSessionId } from '../lib/session'
-import { diagnoseLeafImage } from '../lib/ai'
+import { diagnoseLeafImage, DIAGNOSIS_PROMPT_VERSION } from '../lib/ai'
+import { checkImageQuality, retakePhotoAdvice } from '../lib/imageQuality'
+import { validateDiagnosisRaw } from '../lib/validation'
+import { checkRateLimit, rateLimitResponseBody, RATE_LIMITS } from '../lib/rateLimit'
 
 const diagnosis = new Hono<{ Bindings: Bindings }>()
 
 // POST /api/diagnosis/analyze
 // Accepts multipart/form-data with field "image".
-// Runs AI vision diagnosis, stores the uploaded image in R2, saves the
-// full result to D1, and returns the diagnosis to the client.
+// Pipeline: rate-limit -> image quality pre-check -> AI vision diagnosis
+// (with model fallback) -> deterministic guardrail validation -> R2 image
+// store -> D1 save -> response.
 diagnosis.post('/analyze', async (c) => {
   const sessionId = getOrCreateSessionId(c)
+
+  // PHASE 1: rate limiting -- protect against AI cost abuse per session.
+  const rl = checkRateLimit(sessionId, RATE_LIMITS.diagnosis)
+  if (!rl.allowed) {
+    return c.json(rateLimitResponseBody(rl, 'diagnosis'), 429)
+  }
 
   const body = await c.req.parseBody()
   const file = body['image']
@@ -30,6 +40,22 @@ diagnosis.post('/analyze', async (c) => {
   const arrayBuffer = await file.arrayBuffer()
   const bytes = new Uint8Array(arrayBuffer)
 
+  // PHASE 5: Image quality pre-check BEFORE spending an AI call.
+  const quality = checkImageQuality(bytes, file.type, file.size)
+  if (!quality.ok) {
+    const blocking = quality.issues.filter((i) => i.severity === 'block')
+    return c.json(
+      {
+        is_leaf: null,
+        image_rejected: true,
+        problems: blocking.map((i) => i.message),
+        how_to_retake: retakePhotoAdvice()
+      },
+      400
+    )
+  }
+  const qualityWarnings = quality.issues.filter((i) => i.severity === 'warn').map((i) => i.message)
+
   // Build a data URL for the vision model
   let binary = ''
   const chunkSize = 8192
@@ -39,12 +65,26 @@ diagnosis.post('/analyze', async (c) => {
   const base64 = btoa(binary)
   const dataUrl = `data:${file.type};base64,${base64}`
 
-  let result
+  let aiOutcome
   try {
-    result = await diagnoseLeafImage(c.env.OPENAI_API_KEY, c.env.OPENAI_BASE_URL, dataUrl, c.env.DB, sessionId)
+    aiOutcome = await diagnoseLeafImage(c.env.OPENAI_API_KEY, c.env.OPENAI_BASE_URL, dataUrl, c.env.DB, sessionId)
   } catch (e: any) {
     return c.json({ error: `AI diagnosis failed: ${e.message || e}` }, 502)
   }
+
+  // PHASE 6: deterministic guardrail validation of the AI's structured output.
+  const validation = validateDiagnosisRaw(aiOutcome.raw)
+  if (validation.status === 'failed' || !validation.value) {
+    return c.json(
+      {
+        error:
+          'The AI returned a result we could not reliably validate (missing required fields). Please try again, ideally with a clearer photo.',
+        validation_issues: validation.issues.map((i) => i.problem)
+      },
+      502
+    )
+  }
+  const result = validation.value
 
   if (!result.is_leaf) {
     return c.json({
@@ -62,11 +102,13 @@ diagnosis.post('/analyze', async (c) => {
     imageKey = null
   }
 
+  let insertedId: number | null = null
   try {
-    await c.env.DB.prepare(
+    const insertRes = await c.env.DB.prepare(
       `INSERT INTO diagnoses
-        (session_id, image_key, plant_name, disease_name, is_healthy, confidence, severity, symptoms, spread, treatment, prevention, raw_ai_response)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        (session_id, image_key, plant_name, disease_name, is_healthy, confidence, severity, symptoms, spread, treatment, prevention, raw_ai_response,
+         confidence_level, secondary_possibilities, image_quality_warnings, validation_status, prompt_version)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
       .bind(
         sessionId,
@@ -80,31 +122,71 @@ diagnosis.post('/analyze', async (c) => {
         JSON.stringify(result.spread),
         JSON.stringify(result.treatment),
         JSON.stringify(result.prevention),
-        JSON.stringify(result)
+        JSON.stringify(result),
+        result.confidence_level,
+        JSON.stringify(result.secondary_possibilities),
+        JSON.stringify(qualityWarnings),
+        validation.status,
+        DIAGNOSIS_PROMPT_VERSION
       )
       .run()
+    insertedId = (insertRes.meta as any)?.last_row_id ?? null
   } catch (e) {
     // Non-fatal: still return the diagnosis even if history save fails
   }
 
-  return c.json({ is_leaf: true, image_key: imageKey, ...result })
+  return c.json({
+    ...result,
+    id: insertedId,
+    image_key: imageKey,
+    image_quality_warnings: qualityWarnings,
+    model_used: aiOutcome.modelUsed,
+    fallback_used: aiOutcome.fallbackUsed
+  })
 })
 
-// GET /api/diagnosis/history
+// GET /api/diagnosis/history -- search/filter/pagination (Phase 15)
 diagnosis.get('/history', async (c) => {
   const sessionId = getOrCreateSessionId(c)
   const dateFilter = c.req.query('date') // YYYY-MM-DD optional
+  const plantFilter = c.req.query('plant')
+  const diseaseFilter = c.req.query('disease')
+  const searchQ = c.req.query('q')
+  const page = Math.max(1, parseInt(c.req.query('page') || '1', 10) || 1)
+  const pageSize = Math.min(50, Math.max(1, parseInt(c.req.query('page_size') || '10', 10) || 10))
 
-  let query = `SELECT * FROM diagnoses WHERE session_id = ?`
+  const conditions: string[] = ['session_id = ?']
   const params: any[] = [sessionId]
+
   if (dateFilter) {
-    query += ` AND date(created_at) = ?`
+    conditions.push('date(created_at) = ?')
     params.push(dateFilter)
   }
-  query += ` ORDER BY created_at DESC`
+  if (plantFilter) {
+    conditions.push('plant_name LIKE ?')
+    params.push(`%${plantFilter}%`)
+  }
+  if (diseaseFilter) {
+    conditions.push('disease_name LIKE ?')
+    params.push(`%${diseaseFilter}%`)
+  }
+  if (searchQ) {
+    conditions.push('(plant_name LIKE ? OR disease_name LIKE ?)')
+    params.push(`%${searchQ}%`, `%${searchQ}%`)
+  }
 
-  const { results } = await c.env.DB.prepare(query)
+  const whereClause = conditions.join(' AND ')
+
+  const countRow = await c.env.DB.prepare(`SELECT COUNT(*) as cnt FROM diagnoses WHERE ${whereClause}`)
     .bind(...params)
+    .first()
+  const totalMatching = (countRow as any)?.cnt ?? 0
+
+  const offset = (page - 1) * pageSize
+  const { results } = await c.env.DB.prepare(
+    `SELECT * FROM diagnoses WHERE ${whereClause} ORDER BY created_at DESC LIMIT ? OFFSET ?`
+  )
+    .bind(...params, pageSize, offset)
     .all()
 
   const parsed = results.map((r: any) => ({
@@ -112,18 +194,50 @@ diagnosis.get('/history', async (c) => {
     symptoms: safeParse(r.symptoms),
     spread: safeParse(r.spread),
     treatment: safeParse(r.treatment),
-    prevention: safeParse(r.prevention)
+    prevention: safeParse(r.prevention),
+    secondary_possibilities: safeParse(r.secondary_possibilities),
+    image_quality_warnings: safeParse(r.image_quality_warnings)
   }))
 
-  const total = parsed.length
+  // Stats computed over the user's FULL history (not just this page/filtered view)
+  const { results: allForStats } = await c.env.DB.prepare(
+    `SELECT confidence, created_at FROM diagnoses WHERE session_id = ?`
+  )
+    .bind(sessionId)
+    .all()
+  const total = allForStats.length
   const avgConfidence =
-    total > 0 ? parsed.reduce((sum: number, r: any) => sum + (r.confidence || 0), 0) / total : 0
+    total > 0 ? (allForStats as any[]).reduce((sum, r) => sum + (r.confidence || 0), 0) / total : 0
   const todayStr = new Date().toISOString().slice(0, 10)
-  const todayCount = parsed.filter((r: any) => (r.created_at || '').slice(0, 10) === todayStr).length
+  const todayCount = (allForStats as any[]).filter((r) => (r.created_at || '').slice(0, 10) === todayStr).length
 
   return c.json({
     records: parsed,
+    page,
+    page_size: pageSize,
+    total_matching: totalMatching,
+    total_pages: Math.max(1, Math.ceil(totalMatching / pageSize)),
     stats: { total, avg_confidence: Math.round(avgConfidence * 10) / 10, today_count: todayCount }
+  })
+})
+
+// GET /api/diagnosis/history/:id -- single record (used by report/chat context)
+diagnosis.get('/history/:id', async (c) => {
+  const sessionId = getOrCreateSessionId(c)
+  const id = c.req.param('id')
+  const row = await c.env.DB.prepare(`SELECT * FROM diagnoses WHERE id = ? AND session_id = ?`)
+    .bind(id, sessionId)
+    .first()
+  if (!row) return c.json({ error: 'Record not found.' }, 404)
+  const r = row as any
+  return c.json({
+    ...r,
+    symptoms: safeParse(r.symptoms),
+    spread: safeParse(r.spread),
+    treatment: safeParse(r.treatment),
+    prevention: safeParse(r.prevention),
+    secondary_possibilities: safeParse(r.secondary_possibilities),
+    image_quality_warnings: safeParse(r.image_quality_warnings)
   })
 })
 
@@ -143,6 +257,31 @@ diagnosis.get('/image/*', async (c) => {
   return new Response(obj.body, {
     headers: { 'Content-Type': obj.httpMetadata?.contentType || 'image/jpeg' }
   })
+})
+
+// POST /api/diagnosis/:id/feedback  { feedback: 'helpful' | 'not_helpful' }  (Phase 3)
+diagnosis.post('/:id/feedback', async (c) => {
+  const sessionId = getOrCreateSessionId(c)
+  const id = c.req.param('id')
+  const { feedback } = await c.req.json<{ feedback: string }>()
+  if (feedback !== 'helpful' && feedback !== 'not_helpful') {
+    return c.json({ error: 'feedback must be "helpful" or "not_helpful"' }, 400)
+  }
+
+  const owns = await c.env.DB.prepare(`SELECT id FROM diagnoses WHERE id = ? AND session_id = ?`)
+    .bind(id, sessionId)
+    .first()
+  if (!owns) return c.json({ error: 'Diagnosis not found.' }, 404)
+
+  await c.env.DB.prepare(
+    `INSERT INTO ai_feedback (request_type, target_type, target_id, session_id, feedback)
+     VALUES ('diagnosis', 'diagnosis', ?, ?, ?)
+     ON CONFLICT(target_type, target_id, session_id) DO UPDATE SET feedback = excluded.feedback, created_at = CURRENT_TIMESTAMP`
+  )
+    .bind(id, sessionId, feedback)
+    .run()
+
+  return c.json({ success: true })
 })
 
 function safeParse(v: any) {
