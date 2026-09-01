@@ -5,6 +5,13 @@
 //
 // Uses plain fetch() instead of the `openai` npm package to keep the
 // Worker bundle small and avoid Node-specific dependencies.
+//
+// AI Observability: every call through callChatCompletions() is logged
+// (best-effort, never blocking/breaking the actual AI request) via
+// logAiCall() in ./aiObservability. This is the single shared place all
+// AI calls flow through, so no route needs to duplicate logging logic.
+
+import { logAiCall, type AiRequestType } from './aiObservability'
 
 export type ChatMessage = {
   role: 'system' | 'user' | 'assistant'
@@ -16,33 +23,101 @@ export type ChatMessage = {
 
 const MODEL = 'gpt-5'
 
+// Optional observability context passed by callers. `db` is intentionally
+// optional -- if it's not provided (or the insert fails), the AI call still
+// proceeds normally and just isn't logged.
+type ObservabilityContext = {
+  db?: D1Database
+  requestType: AiRequestType
+  promptVersion: string
+  sessionId?: string | null
+}
+
 async function callChatCompletions(
   apiKey: string,
   baseUrl: string,
   messages: ChatMessage[],
-  jsonMode: boolean
+  jsonMode: boolean,
+  obs: ObservabilityContext
 ): Promise<string> {
-  const res = await fetch(`${baseUrl}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`
-    },
-    body: JSON.stringify({
+  const startedAt = Date.now()
+
+  const logResult = (args: {
+    success: boolean
+    errorType?: string
+    errorMessage?: string
+    promptTokens?: number
+    completionTokens?: number
+    totalTokens?: number
+  }) => {
+    if (!obs.db) return Promise.resolve()
+    return logAiCall({
+      db: obs.db,
+      requestType: obs.requestType,
       model: MODEL,
-      messages,
-      ...(jsonMode ? { response_format: { type: 'json_object' } } : {})
+      promptVersion: obs.promptVersion,
+      sessionId: obs.sessionId ?? null,
+      latencyMs: Date.now() - startedAt,
+      ...args
     })
-  })
+  }
+
+  let res: Response
+  try {
+    res = await fetch(`${baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        model: MODEL,
+        messages,
+        ...(jsonMode ? { response_format: { type: 'json_object' } } : {})
+      })
+    })
+  } catch (e: any) {
+    await logResult({
+      success: false,
+      errorType: 'network_error',
+      errorMessage: e?.message || String(e)
+    })
+    throw e
+  }
 
   if (!res.ok) {
     const errText = await res.text().catch(() => '')
+    await logResult({
+      success: false,
+      errorType: `http_${res.status}`,
+      errorMessage: errText.slice(0, 300)
+    })
     throw new Error(`AI API error ${res.status}: ${errText.slice(0, 500)}`)
   }
 
   const data = await res.json<any>()
   const content = data?.choices?.[0]?.message?.content
-  if (!content) throw new Error('AI API returned no content')
+  const usage = data?.usage || {}
+
+  if (!content) {
+    await logResult({
+      success: false,
+      errorType: 'empty_content',
+      errorMessage: 'AI API returned no content',
+      promptTokens: usage.prompt_tokens,
+      completionTokens: usage.completion_tokens,
+      totalTokens: usage.total_tokens
+    })
+    throw new Error('AI API returned no content')
+  }
+
+  await logResult({
+    success: true,
+    promptTokens: usage.prompt_tokens,
+    completionTokens: usage.completion_tokens,
+    totalTokens: usage.total_tokens
+  })
+
   return content
 }
 
@@ -59,6 +134,8 @@ export type DiagnosisResult = {
   prevention: string[]
   notes: string
 }
+
+const DIAGNOSIS_PROMPT_VERSION = 'diagnosis-v1'
 
 const DIAGNOSIS_SYSTEM_PROMPT = `You are PlantGuard AI, an expert plant pathologist and agronomist.
 You will be shown a photo. Perform these steps:
@@ -88,7 +165,9 @@ Respond ONLY with a single JSON object matching exactly this shape, no markdown,
 export async function diagnoseLeafImage(
   apiKey: string,
   baseUrl: string,
-  imageDataUrl: string
+  imageDataUrl: string,
+  db?: D1Database,
+  sessionId?: string | null
 ): Promise<DiagnosisResult> {
   const raw = await callChatCompletions(
     apiKey,
@@ -103,7 +182,8 @@ export async function diagnoseLeafImage(
         ]
       }
     ],
-    true
+    true,
+    { db, requestType: 'diagnosis', promptVersion: DIAGNOSIS_PROMPT_VERSION, sessionId }
   )
 
   const parsed = JSON.parse(raw)
@@ -122,6 +202,8 @@ export async function diagnoseLeafImage(
   }
 }
 
+const CHATBOT_PROMPT_VERSION = 'chatbot-v1'
+
 const CHATBOT_SYSTEM_PROMPT = `You are PlantGuard AI Assistant, a friendly and knowledgeable virtual agronomist and plant-care expert.
 Help farmers and plant lovers with questions about plant diseases, pest control, cultivation practices, soil, watering, fertilizers, and general gardening.
 Keep answers practical, concise, and easy to understand. Use simple language. Use short paragraphs or bullet points when listing steps.
@@ -130,13 +212,20 @@ If the user writes in Urdu/Roman Urdu, you may respond in the same style to be h
 export async function chatWithAssistant(
   apiKey: string,
   baseUrl: string,
-  history: { role: 'user' | 'assistant'; content: string }[]
+  history: { role: 'user' | 'assistant'; content: string }[],
+  db?: D1Database,
+  sessionId?: string | null
 ): Promise<string> {
   const messages: ChatMessage[] = [
     { role: 'system', content: CHATBOT_SYSTEM_PROMPT },
     ...history.map((h) => ({ role: h.role, content: h.content }))
   ]
-  return callChatCompletions(apiKey, baseUrl, messages, false)
+  return callChatCompletions(apiKey, baseUrl, messages, false, {
+    db,
+    requestType: 'chat',
+    promptVersion: CHATBOT_PROMPT_VERSION,
+    sessionId
+  })
 }
 
 export type CultivationGuide = {
@@ -149,10 +238,14 @@ export type CultivationGuide = {
   extra_tips: string[]
 }
 
+const CULTIVATION_PROMPT_VERSION = 'cultivation-v1'
+
 export async function generateCultivationGuide(
   apiKey: string,
   baseUrl: string,
-  plantName: string
+  plantName: string,
+  db?: D1Database,
+  sessionId?: string | null
 ): Promise<CultivationGuide> {
   const raw = await callChatCompletions(
     apiKey,
@@ -175,7 +268,8 @@ Keep each string field to 1-2 short sentences. extra_tips should have 3-5 short 
       },
       { role: 'user', content: `Plant/crop: ${plantName}` }
     ],
-    true
+    true,
+    { db, requestType: 'library_cultivation', promptVersion: CULTIVATION_PROMPT_VERSION, sessionId }
   )
   const parsed = JSON.parse(raw)
   return {
@@ -197,10 +291,14 @@ export type DiseaseInfo = {
   prevention: string[]
 }
 
+const DISEASE_INFO_PROMPT_VERSION = 'disease-info-v1'
+
 export async function generateDiseaseInfo(
   apiKey: string,
   baseUrl: string,
-  diseaseName: string
+  diseaseName: string,
+  db?: D1Database,
+  sessionId?: string | null
 ): Promise<DiseaseInfo> {
   const raw = await callChatCompletions(
     apiKey,
@@ -221,7 +319,8 @@ Each array should have 3-6 short, concrete bullet-point strings.`
       },
       { role: 'user', content: `Disease: ${diseaseName}` }
     ],
-    true
+    true,
+    { db, requestType: 'library_disease', promptVersion: DISEASE_INFO_PROMPT_VERSION, sessionId }
   )
   const parsed = JSON.parse(raw)
   return {

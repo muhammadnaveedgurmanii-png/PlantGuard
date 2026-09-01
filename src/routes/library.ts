@@ -48,7 +48,7 @@ library.get('/cultivation', async (c) => {
   }
 
   try {
-    const guide = await generateCultivationGuide(c.env.OPENAI_API_KEY, c.env.OPENAI_BASE_URL, plant)
+    const guide = await generateCultivationGuide(c.env.OPENAI_API_KEY, c.env.OPENAI_BASE_URL, plant, c.env.DB)
     await c.env.DB.prepare(
       `INSERT INTO cultivation_cache (plant_name, watering, sunlight, temperature, soil, fertilizer, spacing, extra_tips)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -95,7 +95,7 @@ library.get('/disease', async (c) => {
   }
 
   try {
-    const info = await generateDiseaseInfo(c.env.OPENAI_API_KEY, c.env.OPENAI_BASE_URL, name)
+    const info = await generateDiseaseInfo(c.env.OPENAI_API_KEY, c.env.OPENAI_BASE_URL, name, c.env.DB)
     await c.env.DB.prepare(
       `INSERT INTO disease_cache (disease_name, plant_name, symptoms, spread, treatment, prevention)
        VALUES (?, ?, ?, ?, ?, ?)

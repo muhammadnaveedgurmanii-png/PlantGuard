@@ -32,7 +32,7 @@ chatbot.post('/send', async (c) => {
 
   let reply: string
   try {
-    reply = await chatWithAssistant(c.env.OPENAI_API_KEY, c.env.OPENAI_BASE_URL, history)
+    reply = await chatWithAssistant(c.env.OPENAI_API_KEY, c.env.OPENAI_BASE_URL, history, c.env.DB, sessionId)
   } catch (e: any) {
     return c.json({ error: `AI chatbot failed: ${e.message || e}` }, 502)
   }

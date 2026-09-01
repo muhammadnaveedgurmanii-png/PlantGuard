@@ -41,7 +41,7 @@ diagnosis.post('/analyze', async (c) => {
 
   let result
   try {
-    result = await diagnoseLeafImage(c.env.OPENAI_API_KEY, c.env.OPENAI_BASE_URL, dataUrl)
+    result = await diagnoseLeafImage(c.env.OPENAI_API_KEY, c.env.OPENAI_BASE_URL, dataUrl, c.env.DB, sessionId)
   } catch (e: any) {
     return c.json({ error: `AI diagnosis failed: ${e.message || e}` }, 502)
   }
