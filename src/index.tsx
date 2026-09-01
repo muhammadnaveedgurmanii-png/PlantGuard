@@ -48,13 +48,18 @@ const INDEX_HTML = `<!DOCTYPE html>
   <script src="https://cdn.tailwindcss.com"></script>
   <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
   <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <link href="/static/style.css" rel="stylesheet">
+  <link href="/static/css/tokens.css" rel="stylesheet">
+  <link href="/static/css/base.css" rel="stylesheet">
+  <link href="/static/css/components.css" rel="stylesheet">
+  <link href="/static/css/layout.css" rel="stylesheet">
+  <link href="/static/css/responsive.css" rel="stylesheet">
 </head>
 <body>
+  <a href="#app" class="skip-link">Skip to main content</a>
   <div id="app"></div>
   <script src="https://cdn.jsdelivr.net/npm/axios@1.6.0/dist/axios.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/marked@9.1.6/marked.min.js"></script>
-  <script type="module" src="/static/app.js"></script>
+  <script type="module" src="/static/js/main.js"></script>
 </body>
 </html>`
 
